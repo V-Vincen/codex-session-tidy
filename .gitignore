@@ -1,1 +1,32 @@
+# macOS 本地文件
 .DS_Store
+
+# Python 自动生成文件与本地环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# 本地任务记录与备份，不包含可共享的源码和结构白名单
+/runs/
+/backups/
+*.bak
+
+# 防止误提交复制到项目中的真实会话数据
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+rollout-*.jsonl
+rollout-*.jsonl.zst
+session_index.jsonl
+.codex-global-state.json
+
+# 本地环境凭据；示例文件可以提交
+.env
+.env.*
+!.env.example
