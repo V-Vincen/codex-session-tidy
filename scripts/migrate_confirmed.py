@@ -47,48 +47,109 @@ def guard(state, global_state):
             or 'thread-workspace-root-hints:' in k or 'thread-projectless-output-directories:' in k}})
 
 
-def confirmed_root_removals(state, g, base):
-    """仅处理用户已确认的两项侧栏外登记；侧栏仍挂载或会话另有目录时停止。"""
+def project_primary_paths(state, g):
+    """按项目数据推断唯一主目录，返回 legacy project id 到主目录的映射。"""
     mapping = next(iter(g['app-server-project-id-by-legacy-project-id-by-host'].values()))
-    removals = []
-    for name, primary, extra in (
-            ('devops', base / 'devops', base / 'cm_bird'),
-            ('fullstack-quality-kit', base / 'my_skill/fullstack-quality-kit', base)):
-        matches = [(legacy, project) for legacy, project in g['local-projects'].items()
-                   if project['name'] == name]
-        core.require(len(matches) == 1, '已确认项目缺失或重名：' + name)
-        legacy, project = matches[0]
+    db_projects = {p['id'] for p in state['projects']}
+    result = {}
+    for legacy, project in g.get('local-projects', {}).items():
         pid = mapping.get(legacy)
-        core.require(pid in {p['id'] for p in state['projects']}, '项目映射无效：' + name)
-        core.require(project['rootPaths'] == [str(primary)] and primary.is_dir(), '侧栏挂载前提变化：' + name)
+        if pid not in db_projects:
+            continue
+        paths = project.get('rootPaths')
+        core.require(isinstance(paths, list) and paths and all(isinstance(x, str) for x in paths),
+                     '项目挂载结构未知：' + str(project.get('name')))
         roots = [r for r in state['project_roots'] if r['project_id'] == pid]
-        core.require(any(r['path'] == str(primary) for r in roots), '数据库缺少项目主目录：' + name)
-        core.require(all(t['cwd'] == str(primary) for t in state['threads'] if t['project_id'] == pid),
-                     '项目内存在其他工作目录：' + name)
-        matches = [r for r in roots if r['path'] == str(extra)]
-        core.require(len(matches) <= 1, '额外目录登记重复，停止自动处理：' + name)
-        removals.extend(matches)
+        # 侧栏可能先于数据库写入新建空项目；没有数据库根登记时不把它误判为挂载异常。
+        if not roots:
+            continue
+        core.require(set(paths) <= {r['path'] for r in roots}, '侧栏挂载未登记：' + str(project.get('name')))
+        cwds = {t['cwd'] for t in state['threads'] if t['project_id'] == pid}
+        core.require(cwds <= set(paths), '项目会话工作目录未登记：' + str(project.get('name')))
+        candidates = set(paths) & cwds
+        if len(candidates) > 1:
+            raise core.Blocked('项目主目录不明确：' + str(project.get('name')))
+        if not candidates:
+            core.require(len(paths) == 1, '项目主目录不明确：' + str(project.get('name')))
+            primary = paths[0]
+        else:
+            primary = next(iter(candidates))
+        core.require(Path(primary).is_dir(), '项目主目录无效：' + str(project.get('name')))
+        result[legacy] = primary
+    return result
+
+
+def confirmed_root_removals(state, g, base=None):
+    """按项目会话工作目录清理所有可确定的额外挂载登记。"""
+    mapping = next(iter(g['app-server-project-id-by-legacy-project-id-by-host'].values()))
+    primary = project_primary_paths(state, g)
+    removals = []
+    for legacy, main_path in primary.items():
+        pid = mapping[legacy]
+        roots = [r for r in state['project_roots'] if r['project_id'] == pid]
+        removals.extend(r for r in roots if r['path'] != main_path)
     return removals
+
+
+def detect_migrations(state, g, base):
+    """从侧栏主目录与会话 cwd 的差异识别项目整体迁移，不依赖项目名称。"""
+    mapping = next(iter(g['app-server-project-id-by-legacy-project-id-by-host'].values()))
+    projects = g.get('local-projects', {})
+    db_projects = {p['id'] for p in state['projects']}
+    assignments = g.get('thread-project-assignments', {})
+    detected = []
+    for legacy, project in projects.items():
+        pid = mapping.get(legacy)
+        if pid not in db_projects:
+            continue
+        roots = project.get('rootPaths')
+        if not isinstance(roots, list) or len(roots) != 1 or not isinstance(roots[0], str):
+            continue
+        target = roots[0]
+        db_roots = {r['path'] for r in state['project_roots'] if r['project_id'] == pid}
+        old = {path for path in db_roots - {target}
+               if Path(path).name == Path(target).name}
+        if not old and not Path(target).exists():
+            # 仅在共同基准目录下找到唯一同名目录时推断迁移目标。
+            candidates = [p for p in base.rglob(Path(target).name) if p.is_dir()]
+            if len(candidates) == 1:
+                old = {target}
+                target = str(candidates[0])
+        if len(old) > 1:
+            raise core.Blocked('项目迁移来源不明确：' + str(project.get('name')))
+        if old:
+            source = next(iter(old))
+            if Path(source).name != Path(target).name or not Path(target).is_dir():
+                raise core.Blocked('项目迁移目标不明确：' + str(project.get('name')))
+            detected.append({'legacy': legacy, 'project_id': pid, 'old': source, 'new': target})
+    return detected
+
+
+def temp_target(state, g):
+    """查找有效 temp 项目；仅用于归属项目已消失的归档会话兜底。"""
+    mapping = next(iter(g['app-server-project-id-by-legacy-project-id-by-host'].values()))
+    matches = [(legacy, item) for legacy, item in g.get('local-projects', {}).items()
+               if item.get('name') == 'temp' and mapping.get(legacy) in {p['id'] for p in state['projects']}]
+    core.require(len(matches) == 1, '有效 temp 项目不存在或重名')
+    legacy, item = matches[0]
+    core.require(len(item.get('rootPaths', [])) == 1 and Path(item['rootPaths'][0]).is_dir(), 'temp 主目录无效')
+    return legacy, mapping[legacy], item['rootPaths'][0]
 
 
 def build(home, base, prune_roots=False):
     state = core.snapshot(home)
     core.require(core.digest(state['schema']) in core.load(Path(__file__).parents[1] / 'references/supported-schemas.json').values(), '数据库结构不在白名单中')
     g = core.load(home / GLOBAL)
-    old = str(base / 'fullstack-quality-kit')
-    new = str(base / 'my_skill/fullstack-quality-kit')
-    kkai = str(base / 'KKAI')
-    core.require(Path(new).is_dir() and not Path(old).exists() and not Path(kkai).exists(), '确认的迁移目录前提不成立')
     projects = g['local-projects']
     mappings = g['app-server-project-id-by-legacy-project-id-by-host']
     core.require(len(mappings) == 1, '存在多个主机映射，需单独核验')
     mapping = next(iter(mappings.values()))
     db_projects = {p['id']: p for p in state['projects']}
-    def named(name):
-        ids = [pid for pid, p in projects.items() if p['name'] == name]
-        core.require(len(ids) == 1 and mapping.get(ids[0]) in db_projects, '目标项目不存在或重名：' + name)
-        return ids[0]
-    full, temp = named('fullstack-quality-kit'), named('temp')
+    migrations = detect_migrations(state, g, base)
+    migration_by_old = {item['old']: item for item in migrations}
+    temp, temp_pid, temp_root = temp_target(state, g)
+    assignment_by_thread = {tid: value.get('projectId') for tid, value in g.get('thread-project-assignments', {}).items()
+                            if isinstance(value, dict)}
     result = []
     assignments = g['thread-project-assignments']
     for t in state['threads']:
@@ -98,20 +159,20 @@ def build(home, base, prune_roots=False):
         legacy = assignment.get('projectId') if assignment else None
         if legacy:
             core.require(legacy in projects and legacy in mapping, '当前关联指向未知项目')
-        is_full = Path(cwd).is_relative_to(old)
-        is_kkai = Path(cwd).is_relative_to(kkai)
-        primary = path_map(projects[legacy]['rootPaths'][0], old, new) if legacy else None
+        migration = next((item for item in migrations if legacy == item['legacy']), None)
+        source_migration = next((item for old, item in migration_by_old.items()
+                                 if Path(cwd).is_relative_to(Path(old))), None)
+        primary = projects[legacy]['rootPaths'][0] if legacy and legacy in projects and projects[legacy].get('rootPaths') else None
         moved = bool(legacy and (mapping[legacy] != t['project_id'] or cwd != primary))
-        orphan_archived = bool(t['archived'] and not legacy and not t['project_id'])
-        if not (is_full or is_kkai or moved or orphan_archived):
+        known_project_ids = set(db_projects)
+        assignment_missing = legacy is None or legacy not in projects or mapping.get(legacy) not in known_project_ids
+        orphan_archived = bool(t['archived'] and assignment_missing and t.get('project_id') not in known_project_ids)
+        if not (source_migration or migration or moved or orphan_archived):
             continue
-        if is_full:
-            legacy, target_cwd = full, path_map(cwd, old, new)
-        elif is_kkai or orphan_archived:
-            legacy = legacy or temp
-            roots = projects[legacy]['rootPaths']
-            core.require(roots, '目标项目缺少目录')
-            target_cwd = path_map(roots[0], old, new)
+        if source_migration:
+            legacy, target_cwd = source_migration['legacy'], path_map(cwd, source_migration['old'], source_migration['new'])
+        elif orphan_archived:
+            legacy, target_cwd = temp, temp_root
         else:
             target_cwd = primary
         core.require(legacy is not None and Path(target_cwd).is_dir(), '目标工作目录无效，停止本批修复')
@@ -132,8 +193,14 @@ def build(home, base, prune_roots=False):
         with core.connect(home / 'thread_history_1.sqlite') as db:
             history = {'before': history_guard(db, result), 'after': history_guard(db, result, True)}
     removals = confirmed_root_removals(state, g, base) if prune_roots else []
+    orphan_root_paths = sorted({t['cwd'] for t in state['threads']
+                                if t['archived'] and not t['project_id'] and not Path(t['cwd']).exists()})
     return {'id': core.run_id(), 'kind': 'confirmed-migration-v1', 'home': str(home), 'history': history,
-            'base': str(base), 'old': old, 'new': new, 'kkai': kkai,
+            'base': str(base), 'path_maps': migrations, 'orphan_root_paths': orphan_root_paths,
+            # 兼容旧计划读取；实际处理只使用上面的数据驱动集合。
+            'old': migrations[0]['old'] if migrations else '',
+            'new': migrations[0]['new'] if migrations else '',
+            'kkai': orphan_root_paths[0] if orphan_root_paths else '',
             'guard': guard(state, g), 'schema': core.digest(state['schema']), 'changes': result,
             'archive': {t['id']: [t['archived'], t.get('archived_at')] for t in state['threads']},
             'root_removals': removals,
@@ -275,8 +342,10 @@ def transform(g, p):
     g = copy.deepcopy(g)
     changes = {c['id']: c for c in p['changes']}
     for project in g['local-projects'].values():
-        project['rootPaths'] = list(dict.fromkeys(path_map(r, p['old'], p['new'])
-                                                for r in project['rootPaths'] if r != p['kkai']))
+        paths = project.get('rootPaths', [])
+        for item in p.get('path_maps', []):
+            paths = [path_map(r, item['old'], item['new']) for r in paths]
+        project['rootPaths'] = list(dict.fromkeys(paths))
     for tid, c in changes.items():
         g['thread-project-assignments'][tid] = {'projectKind': 'local', 'projectId': c['legacy_project']}
         g.setdefault('thread-project-membership-host-ids', {})[tid] = 'local'
@@ -300,8 +369,11 @@ def transform(g, p):
                         if isinstance(v, list):
                             return list(dict.fromkeys(convert(x) for x in v))
                         core.require(isinstance(v, str), '未知目录提示值')
-                        v = path_map(v, p['old'], p['new'])
-                        return path_map(v, p['kkai'], c['after']['cwd'])
+                        for item in p.get('path_maps', []):
+                            v = path_map(v, item['old'], item['new'])
+                        for old in p.get('orphan_root_paths', []):
+                            v = path_map(v, old, c['after']['cwd'])
+                        return v
                     values[tid] = convert(value)
     g['projectless-thread-ids'] = [tid for tid in g.get('projectless-thread-ids', []) if tid not in changes]
     return g
@@ -325,10 +397,13 @@ def mutate(db, p):
         import cleanup_confirmed
         cleanup_confirmed.mutate_state(db, p)
         return  # 清理计划只执行明确清单，不夹带旧迁移路径清理。
-    # 删除已不存在的 KKAI 根目录登记，不删除项目、会话、正文或其他有效根目录。
-    db.execute('DELETE FROM project_roots WHERE path=?', (p['kkai'],))
+    # 删除已不存在的归档来源根目录登记，不删除项目、会话、正文或其他有效根目录。
+    for old in p.get('orphan_root_paths', []):
+        db.execute('DELETE FROM project_roots WHERE path=?', (old,))
     for row in db.execute('SELECT project_id,position,path FROM project_roots').fetchall():
-        target = path_map(row['path'], p['old'], p['new'])
+        target = row['path']
+        for item in p.get('path_maps', []):
+            target = path_map(target, item['old'], item['new'])
         if target != row['path']:
             db.execute('UPDATE project_roots SET path=? WHERE project_id=? AND position=?',
                        (target, row['project_id'], row['position']))
@@ -378,7 +453,10 @@ def validate(p):
                          and first['payload']['cwd'] == c['after']['cwd']
                          and hashlib.sha256(tail).hexdigest() == c['tail_hash'], '正文身份、当前目录或历史内容验证失败')
     if p.get('kind') not in ('confirmed-cleanup-v1', 'body-cwd-repair-v1'):
-        core.require(all(r['path'] != p['kkai'] and path_map(r['path'], p['old'], p['new']) == r['path'] for r in state['project_roots']), '项目根目录仍有旧路径')
+        for r in state['project_roots']:
+            core.require(r['path'] not in p.get('orphan_root_paths', []), '归档来源根目录仍存在')
+            core.require(all(path_map(r['path'], item['old'], item['new']) == r['path']
+                             for item in p.get('path_maps', [])), '项目根目录仍有旧路径')
     for removed in p.get('root_removals', []):
         core.require(not any(r['project_id'] == removed['project_id'] and r['path'] == removed['path']
                              for r in state['project_roots']), '已确认的额外根目录仍存在')
@@ -445,7 +523,8 @@ def execute(p, run, backup_dir, timeout=600):
         state, g = core.snapshot(home), core.load(home / GLOBAL)
         core.require(core.digest(state['schema']) == p['schema'] and guard(state, g) == p['guard'], '待修复的目录、归属或结构变化，请重新生成计划')
         if p.get('kind') != 'body-cwd-repair-v1':
-            core.require(Path(p['new']).is_dir() and not Path(p['old']).exists() and not Path(p['kkai']).exists(), '目录迁移前提变化')
+            for item in p.get('path_maps', []):
+                core.require(Path(item['new']).is_dir() and not Path(item['old']).exists(), '目录迁移前提变化')
         for c in p['changes']:
             core.require(Path(c['after']['cwd']).is_dir(), '目标工作目录不存在')
         cleanup = p.get('kind') == 'confirmed-cleanup-v1'
@@ -567,8 +646,8 @@ def main():
     parser.add_argument('run', nargs='?', help='任务时间戳，替代长计划路径及摘要参数')
     parser.add_argument('--home', type=Path, default=Path.home() / '.codex')
     parser.add_argument('--base', type=Path)
-    parser.add_argument('--prune-confirmed-roots', action='store_true', help='准备已确认的 devops 和 fullstack-quality-kit 额外根登记清理')
-    parser.add_argument('--cleanup-confirmed', action='store_true', help='准备四项已确认挂载及旧空项目、历史残留清理；保留索引和正文')
+    parser.add_argument('--prune-confirmed-roots', action='store_true', help='按项目主目录清理可确定的额外挂载登记')
+    parser.add_argument('--cleanup-confirmed', action='store_true', help='按通用规则清理额外挂载、无关联旧项目和历史残留；保留索引和正文')
     parser.add_argument('--repair-body-cwd', action='store_true', help='按明确侧栏主目录修正数据库与正文当前目录，支持 zstd，无需 --base')
     parser.add_argument('--plan', type=Path)
     parser.add_argument('--confirm')

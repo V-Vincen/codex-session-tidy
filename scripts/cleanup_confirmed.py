@@ -183,27 +183,24 @@ def discover(home, base):
     empty = [r for r in empty if r['id'] not in blocked]
     orphan_ids -= set(blocked)
     roots, sidebar, hints = [], [], []
-    for name, primary, extra in (
-            ('devops', base / 'devops', base / 'cm_bird'),
-            ('fullstack-quality-kit', base / 'my_skill/fullstack-quality-kit', base),
-            ('lkb', base / 'lkb', base),
-            ('codex-session-tidy', base / 'my_skill/codex-session-tidy', base / 'temp')):
-        matches = [(legacy, item) for legacy, item in g['local-projects'].items() if item['name'] == name]
-        if not matches:
-            continue
-        core.require(len(matches) == 1, '项目重名：' + name)
-        legacy, item = matches[0]
+    db_projects = {r['id'] for r in state['projects']}
+    primary_by_legacy = migration.project_primary_paths(state, g)
+    for legacy, item in g['local-projects'].items():
         pid = mapping.get(legacy)
-        core.require(primary.is_dir() and pid in {r['id'] for r in state['projects']}, '主目录或映射无效：' + name)
-        core.require(item['rootPaths'] in ([str(primary)], [str(primary), str(extra)]), '侧栏目录前提变化：' + name)
-        core.require(all(t['cwd'] == str(primary) for t in state['threads'] if t['project_id'] == pid),
-                     '项目内工作目录尚未统一：' + name)
+        if pid not in db_projects or legacy not in primary_by_legacy:
+            continue
+        paths = item.get('rootPaths')
+        core.require(isinstance(paths, list) and paths and all(isinstance(x, str) for x in paths),
+                     '项目挂载结构未知：' + str(item.get('name')))
         db_roots = [r for r in state['project_roots'] if r['project_id'] == pid]
-        core.require(any(r['path'] == str(primary) for r in db_roots), '数据库缺少主目录：' + name)
-        core.require(all(r['path'] in (str(primary), str(extra)) for r in db_roots), '数据库有未适配的挂载：' + name)
-        roots.extend(r for r in db_roots if r['path'] == str(extra))
-        if item['rootPaths'] != [str(primary)]:
-            sidebar.append({'legacy': legacy, 'name': name, 'before': item['rootPaths'], 'after': [str(primary)]})
+        core.require(set(paths) <= {r['path'] for r in db_roots}, '侧栏挂载未登记：' + str(item.get('name')))
+        primary = primary_by_legacy[legacy]
+        extras = [path for path in paths if path != primary]
+        extras += [r['path'] for r in db_roots if r['path'] != primary and r['path'] not in extras]
+        roots.extend(r for r in db_roots if r['path'] in extras)
+        if item['rootPaths'] != [primary]:
+            sidebar.append({'legacy': legacy, 'name': item.get('name'),
+                            'before': item['rootPaths'], 'after': [primary]})
         for key, values in g.items():
             if not any(part in key for part in ('thread-writable-roots:', 'thread-workspace-root-hints:')):
                 continue
@@ -232,7 +229,7 @@ def build(home, base):
     cleanup = discover(home, base)
     core.require(cleanup['guard'] == p['guard'], '检查期间项目或归属发生变化')
     p.update(kind=KIND, cleanup=cleanup, root_removals=cleanup['root_removals'],
-             scope='四项已确认挂载及无关联旧项目、历史残留；保留会话、索引与正文')
+             scope='按项目主目录清理可确定的额外挂载、无关联旧项目和历史残留；保留会话、索引与正文')
     p['deletions'] = {'roots': p['root_removals'], 'projects': cleanup['projects'],
                       'history_ids': cleanup['history_ids'],
                       'history_rows': {k: len(v) for k, v in cleanup['history_rows'].items()}}

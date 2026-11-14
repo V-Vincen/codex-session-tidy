@@ -131,6 +131,33 @@ class ConfirmedCleanup(unittest.TestCase):
         migration.restore(p, run)
         self.assertEqual(self.hashes(), before)
 
+    def test_extra_mount_detection_is_data_driven_for_unlisted_project(self):
+        agent = self.base / 'agent-task-watchdog'
+        agent.mkdir()
+        body = self.home / 'sessions/agent.jsonl'
+        body.write_text(json.dumps({'type': 'session_meta', 'payload':
+                                    {'id': 'agent', 'cwd': str(agent)}}) + '\n')
+        with core.connect(self.home / 'state_5.sqlite', True) as db, db:
+            db.execute('INSERT INTO projects VALUES (?,?)', ('agent', 'agent-task-watchdog'))
+            db.execute('INSERT INTO project_roots VALUES (?,?,?)', ('agent', 0, str(agent)))
+            db.execute('INSERT INTO project_roots VALUES (?,?,?)', ('agent', 1, str(self.base / 'devops')))
+            db.execute('INSERT INTO threads VALUES (?,?,?,?,?,?,?)',
+                       ('agent', '监控任务', str(agent), 'agent', 0, str(body), None))
+        g = core.load(self.home / migration.GLOBAL)
+        g['local-projects']['AGENT'] = {'name': 'agent-task-watchdog',
+                                        'rootPaths': [str(agent), str(self.base / 'devops')]}
+        g['app-server-project-id-by-legacy-project-id-by-host']['local']['AGENT'] = 'agent'
+        g['thread-project-assignments']['agent'] = {'projectId': 'AGENT'}
+        core.save(self.home / migration.GLOBAL, g)
+        p, _ = self.plan()
+        self.assertIn(str(self.base / 'devops'), [r['path'] for r in p['root_removals']])
+        agent_item = next(item for item in p['cleanup']['sidebar'] if item['legacy'] == 'AGENT')
+        self.assertEqual(agent_item['after'], [str(agent)])
+        self.execute(p, _)
+        fresh = cleanup.build(self.home, self.base)
+        self.assertFalse(any(r['project_id'] == 'agent' for r in fresh['root_removals']))
+        self.assertEqual(core.load(self.home / migration.GLOBAL)['local-projects']['AGENT']['rootPaths'], [str(agent)])
+
     def test_live_parent_reference_protects_history(self):
         with core.connect(self.home / 'state_5.sqlite', True) as db, db:
             db.execute('UPDATE threads SET attached_thread_parent_id=? WHERE id=?', ('orphan', 'tidy'))

@@ -215,7 +215,7 @@ def plan(report, targets):
             'preconditions': ['确认本计划摘要', '相关 App 和写入进程退出', '结构与来源数据未变化']}
 
 
-def active():
+def active_processes():
     """检查可执行程序路径，不扫描命令参数以免误报本工具或暴露正文。"""
     output = subprocess.run(['ps', '-axo', 'pid=,comm='], check=True, capture_output=True, text=True).stdout
     names = []
@@ -224,9 +224,21 @@ def active():
         if len(parts) != 2 or int(parts[0]) == os.getpid():
             continue
         executable = parts[1].lower()
-        if any(s in executable for s in ('codex.app/', 'chatgpt.app/', 'cc switch.app/', 'cc-switch.app/')) or Path(executable).name in ('codex', 'cc-switch'):
-            names.append(int(parts[0]))
+        # CC Switch 按用户约定不参与退出、等待或重启，包括其目录内的进程。
+        if any(s in executable for s in ('cc switch.app/', 'cc-switch.app/')) or Path(executable).name == 'cc-switch':
+            continue
+        # 实机退出后会残留崩溃报告进程；只排除已观察到的准确名称和 App 内路径。
+        # 不按 Helpers 目录整体排除，Codex 服务及其他辅助写入器仍须退出。
+        if (Path(executable).name == 'browser_crashpad_handler'
+                and any(s in executable for s in ('codex.app/', 'chatgpt.app/'))):
+            continue
+        if any(s in executable for s in ('codex.app/', 'chatgpt.app/')) or Path(executable).name == 'codex':
+            names.append({'pid': int(parts[0]), 'executable': parts[1]})
     return names
+
+
+def active():
+    return [p['pid'] for p in active_processes()]
 
 
 def offline():
