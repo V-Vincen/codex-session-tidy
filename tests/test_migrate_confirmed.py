@@ -365,6 +365,35 @@ class BodyDirectoryRepair(unittest.TestCase):
         with self.assertRaises(core.Blocked):
             migration.build_body_repair(self.home)
 
+    def test_assignment_string_is_supported(self):
+        self.prepare_body()
+        g = core.load(self.home / migration.GLOBAL)
+        g['thread-project-assignments']['f'] = 'F'
+        core.save(self.home / migration.GLOBAL, g)
+        self.assertEqual([c['id'] for c in migration.build_body_repair(self.home)['changes']], ['f'])
+
+    def test_assignment_object_with_kind_is_supported(self):
+        self.prepare_body()
+        g = core.load(self.home / migration.GLOBAL)
+        g['thread-project-assignments']['f'] = {'projectKind': 'local', 'projectId': 'F'}
+        core.save(self.home / migration.GLOBAL, g)
+        self.assertEqual([c['id'] for c in migration.build_body_repair(self.home)['changes']], ['f'])
+
+    def test_assignment_missing_is_supported(self):
+        self.prepare_body()
+        g = core.load(self.home / migration.GLOBAL)
+        del g['thread-project-assignments']['f']
+        core.save(self.home / migration.GLOBAL, g)
+        self.assertEqual([c['id'] for c in migration.build_body_repair(self.home)['changes']], ['f'])
+
+    def test_assignment_unknown_shape_blocks(self):
+        self.prepare_body()
+        g = core.load(self.home / migration.GLOBAL)
+        g['thread-project-assignments']['f'] = ['F']
+        core.save(self.home / migration.GLOBAL, g)
+        with self.assertRaises(core.Blocked):
+            migration.build_body_repair(self.home)
+
     def test_audit_reports_compressed_cwd_difference(self):
         self.prepare_body(compressed=True, missing_plain=True)
         report = core.audit(self.home)

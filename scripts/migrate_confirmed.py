@@ -243,6 +243,19 @@ def body_delta(change):
     return len(body_bytes(change)) - Path(change['body']).stat().st_size
 
 
+def assignment_project_id(value):
+    """读取会话项目关联的已知结构；未知结构必须阻塞，不能猜测。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        project_id = value.get('projectId')
+        core.require(project_id is None or isinstance(project_id, str), '未知会话关联结构')
+        return project_id
+    raise core.Blocked('未知会话关联结构')
+
+
 def build_body_repair(home):
     """按明确侧栏主目录修正当前元信息，不改归属、挂载、历史或归档。"""
     state, g = core.snapshot(home), core.load(home / GLOBAL)
@@ -264,7 +277,7 @@ def build_body_repair(home):
         core.require(first.get('type') == 'session_meta' and first.get('payload', {}).get('id') == t['id'], '正文身份不符')
         # 无显式侧栏关联时，必须有唯一项目映射；目录以侧栏单一主目录为准。
         candidates = [legacy for legacy, pid in mapping.items() if pid == t['project_id']]
-        assignment = g['thread-project-assignments'].get(t['id'], {}).get('projectId')
+        assignment = assignment_project_id(g['thread-project-assignments'].get(t['id']))
         core.require(len(candidates) == 1 and (assignment is None or assignment == candidates[0]), '正文目标归属不明确')
         project = g['local-projects'][candidates[0]]
         core.require(len(project['rootPaths']) == 1 and Path(project['rootPaths'][0]).is_dir(), '项目主目录不明确')
