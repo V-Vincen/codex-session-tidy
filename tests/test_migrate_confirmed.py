@@ -386,6 +386,19 @@ class BodyDirectoryRepair(unittest.TestCase):
         core.save(self.home / migration.GLOBAL, g)
         self.assertEqual([c['id'] for c in migration.build_body_repair(self.home)['changes']], ['f'])
 
+    def test_projectless_thread_is_skipped(self):
+        self.prepare_body()
+        import json
+        body = self.home / 'sessions/projectless.jsonl'
+        body.write_text(json.dumps({'type': 'session_meta', 'payload': {
+            'id': 'projectless', 'cwd': str(self.base / 'temp')}}) + '\n'
+                        + json.dumps({'type': 'turn_context', 'payload': {
+                            'cwd': str(self.base / 'temp')}}) + '\n')
+        with core.connect(self.db, True) as db, db:
+            db.execute('INSERT INTO threads VALUES (?,?,?,?,?,?)',
+                       ('projectless', '无项目会话', str(self.base / 'temp'), None, 0, str(body)))
+        self.assertEqual([c['id'] for c in migration.build_body_repair(self.home)['changes']], ['f'])
+
     def test_assignment_unknown_shape_blocks(self):
         self.prepare_body()
         g = core.load(self.home / migration.GLOBAL)

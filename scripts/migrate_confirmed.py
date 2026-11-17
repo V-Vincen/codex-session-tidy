@@ -278,6 +278,9 @@ def build_body_repair(home):
         # 无显式侧栏关联时，必须有唯一项目映射；目录以侧栏单一主目录为准。
         candidates = [legacy for legacy, pid in mapping.items() if pid == t['project_id']]
         assignment = assignment_project_id(g['thread-project-assignments'].get(t['id']))
+        if not candidates and assignment is None:
+            # 无项目归属的普通会话没有可推断的目标目录，保留现状并继续检查其他会话。
+            continue
         core.require(len(candidates) == 1 and (assignment is None or assignment == candidates[0]), '正文目标归属不明确')
         project = g['local-projects'][candidates[0]]
         core.require(len(project['rootPaths']) == 1 and Path(project['rootPaths'][0]).is_dir(), '项目主目录不明确')
